@@ -1,0 +1,171 @@
+/**
+ * Generic reverse proxy for *.DOMAIN.com
+ * Maps:
+ *   public:   https://<sub>.DOMAIN.com/<path>   -> https://DOMAIN.com/<sub>/<path>
+ *   wp core:  /wp-login.php, /wp-admin/*, /wp-content/*, /wp-includes/*, /wp-json/* -> same path on apex (no /<sub>)
+ * Keeps the subdomain visible, supports login by rewriting Set-Cookie & Location headers.
+ */
+
+export default {
+  async fetch(request) {
+    const APEX = "DOMAIN.com";
+    const incoming = new URL(request.url);
+
+    // Pass-through for apex/www or other domains
+    if (
+      incoming.hostname === APEX ||
+      incoming.hostname === `www.${APEX}` ||
+      !incoming.hostname.endsWith(`.${APEX}`)
+    ) {
+      return fetch(request);
+    }
+
+    // Extract first label as the "section" subdomain
+    const sub = incoming.hostname.slice(0, -(`.${APEX}`).length).split(".")[0];
+
+    // Paths that should NOT be prefixed with /<sub> on origin (core WP/app APIs/assets)
+    const NO_PREFIX = [
+      /^\/wp-login\.php$/,
+      /^\/wp-admin(\/|$)/,
+      /^\/wp-json(\/|$)/,
+      /^\/wp-content(\/|$)/,
+      /^\/wp-includes(\/|$)/,
+      /^\/xmlrpc\.php$/,
+    ];
+
+    // Build origin URL
+    const origin = new URL(incoming.toString());
+    origin.hostname = APEX;
+    origin.protocol = "https:";
+
+    // Map path: keep core WP paths at root; prefix everything else with /<sub>
+    const needsNoPrefix = NO_PREFIX.some((rx) => rx.test(incoming.pathname));
+    origin.pathname = needsNoPrefix
+      ? incoming.pathname
+      : `/${sub}${incoming.pathname}`;
+    // Query string already carried from incoming.toString()
+
+    // Prepare proxy request without auto-following redirects
+    const init = {
+      method: request.method,
+      headers: new Headers(request.headers),
+      body:
+        request.method === "GET" || request.method === "HEAD"
+          ? undefined
+          : await request.arrayBuffer(),
+      redirect: "manual",
+    };
+
+    // Present as apex to origin; forward original host/proto info
+    init.headers.set("Host", APEX);
+    init.headers.set("X-Forwarded-Host", incoming.host);
+    init.headers.set("X-Forwarded-Proto", "https");
+
+    let res = await fetch(origin.toString(), init);
+
+    // ---- Helpers ----
+    const rewriteLocation = (res) => {
+      const loc = res.headers.get("Location");
+      if (!loc) return null;
+      const u = new URL(loc, origin);
+
+      if (u.hostname !== APEX) return null; // nothing to rewrite
+
+      // If origin redirect points to /<sub>/..., drop /<sub> and set host to <sub>.apex
+      if (u.pathname.startsWith(`/${sub}/`) || u.pathname === `/${sub}`) {
+        u.hostname = `${sub}.${APEX}`;
+        u.pathname = u.pathname.replace(new RegExp(`^/${sub}`), "") || "/";
+      } else if (NO_PREFIX.some((rx) => rx.test(u.pathname))) {
+        // Core paths: keep same path, but host should be the subdomain
+        u.hostname = `${sub}.${APEX}`;
+      } else {
+        // Other absolute URLs on apex that conceptually belong to the sub’s section
+        // Map /foo -> https://<sub>.apex/foo if page is within the section
+        u.hostname = `${sub}.${APEX}`;
+      }
+      return u.toString();
+    };
+
+    const collectSetCookies = (headers) => {
+      const out = [];
+      for (const [k, v] of headers) {
+        if (k.toLowerCase() === "set-cookie") out.push(v);
+      }
+      return out;
+    };
+
+    const mapSetCookie = (cookies, sub, apex) => {
+      // Scope to <sub>.apex and normalize Path=/
+      return cookies.map((c) => {
+        let v = c;
+
+        // Remove any existing Domain attribute then set to subdomain
+        v = v.replace(/;?\s*Domain=[^;]*/gi, "");
+        v += `; Domain=${sub}.${apex}`;
+
+        // Normalize Path to / so cookies work across section/admin
+        if (/;\s*Path=/i.test(v)) {
+          v = v.replace(/;\s*Path=[^;]*/i, "; Path=/");
+        } else {
+          v += "; Path=/";
+        }
+
+        // Ensure Secure; SameSite=Lax at least
+        if (!/;\s*Secure/i.test(v)) v += "; Secure";
+        if (!/;\s*SameSite=/i.test(v)) v += "; SameSite=Lax";
+
+        return v;
+      });
+    };
+
+    // ---- Rewrite 30x Location back to subdomain ----
+    if ([301, 302, 307, 308].includes(res.status)) {
+      const rewritten = rewriteLocation(res);
+      if (rewritten) {
+        const hdrs = new Headers(res.headers);
+        hdrs.set("Location", rewritten);
+        return new Response(null, { status: res.status, headers: hdrs });
+      }
+    }
+
+    // ---- Rewrite Set-Cookie to scope cookies to the subdomain ----
+    const setCookies = collectSetCookies(res.headers);
+    if (setCookies.length) {
+      const hdrs = new Headers(res.headers);
+      hdrs.delete("set-cookie");
+      const mapped = mapSetCookie(setCookies, sub, APEX);
+      for (const c of mapped) hdrs.append("Set-Cookie", c);
+      res = new Response(res.body, { status: res.status, headers: hdrs });
+    }
+
+    // ---- Optional: rewrite absolute links inside HTML so navigation stays on subdomain ----
+    const ct = res.headers.get("content-type") || "";
+    if (ct.includes("text/html")) {
+      let html = await res.text();
+
+      // Replace links that point to the section on apex -> subdomain
+      const abs1 = new RegExp(`https://${APEX}/${sub}/`, "g");
+      const abs2 = new RegExp(`https://${APEX}/${sub}(?!/)`, "g");
+      html = html.replace(abs1, `https://${sub}.${APEX}/`).replace(abs2, `https://${sub}.${APEX}`);
+
+      // Core paths on apex should also reference the subdomain host
+      const coreHosts = [
+        /https:\/\/DOMAIN.COM\.com\/wp-login\.php/gi,
+        /https:\/\/DOMAIN\.com\/wp-admin/gi,
+        /https:\/\/DOMAIN\.com\/wp-json/gi,
+        /https:\/\/DOMAIN\.com\/wp-content/gi,
+        /https:\/\/DOMAIN\.com\/wp-includes/gi,
+      ];
+      for (const rx of coreHosts) {
+        html = html.replace(rx, (m) => m.replace("https://DOMAIN.com", `https://${sub}.${APEX}`));
+      }
+
+      const hdrs = new Headers(res.headers);
+      hdrs.delete("content-length");
+      return new Response(html, { status: res.status, headers: hdrs });
+    }
+
+    // Assets / JSON / binaries passthrough
+    return res;
+  },
+};
